@@ -45,7 +45,7 @@ static void ShowBalloon(const wchar_t *title, const wchar_t *info)
 static void UpdateTrayTip(void)
 {
     wchar_t tip[128];
-    swprintf(tip, 128, L"NoSleep: %dm %02ds", g_minutes, g_seconds % 60);
+    swprintf(tip, 128, L"NoSleep: %dm %02ds", g_seconds / 60, g_seconds % 60);
 
     NOTIFYICONDATAW nid = {0};
     nid.cbSize = sizeof(NOTIFYICONDATAW);
