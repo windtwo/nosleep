@@ -13,11 +13,24 @@
 #define ID_EXIT 1001
 #define WM_TRAYICON (WM_USER + 1)
 
+// 防止显示器关闭的标志 (Windows 10 1607+)
+#define MY_ES_DISPLAY_REQUIRED 0x00000002
+
 static int g_minutes = 0;
 static int g_seconds = 0;
 static HWND g_hwnd = NULL;
 static HICON g_hicon = NULL;
 static NOTIFYICONDATAW g_nid = {0};
+
+// 阻止睡眠和锁屏
+static void KeepAwake(void)
+{
+    // ES_CONTINUOUS - 持续生效
+    // ES_SYSTEM_REQUIRED - 阻止系统睡眠
+    // ES_DISPLAY_REQUIRED - 阻止显示器关闭
+    // ES_AWAYMODE_REQUIRED - 启用离开模式
+    SetThreadExecutionState(ES_CONTINUOUS | ES_SYSTEM_REQUIRED | MY_ES_DISPLAY_REQUIRED | ES_AWAYMODE_REQUIRED);
+}
 
 // 加载图标
 static HICON LoadAppIcon(void)
@@ -114,6 +127,8 @@ static LRESULT CALLBACK TrayWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
             if (wParam == ID_TIMER && g_seconds > 0)
             {
                 g_seconds--;
+                // 每秒调用一次，保持阻止睡眠状态
+                KeepAwake();
                 if (g_seconds == 0)
                 {
                     KillTimer(hwnd, ID_TIMER);
@@ -133,9 +148,16 @@ static LRESULT CALLBACK TrayWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
             }
             break;
 
-        case WM_CLOSE:
+        case WM_DESTROY:
+            KillTimer(hwnd, ID_TIMER);
+            KillTimer(hwnd, 2);
             RemoveTrayIcon();
+            SetThreadExecutionState(ES_CONTINUOUS);  // 恢复系统睡眠
             PostQuitMessage(0);
+            break;
+
+        case WM_CLOSE:
+            DestroyWindow(hwnd);
             break;
 
         default:
@@ -225,11 +247,12 @@ static int ShowInputDialog(HINSTANCE hinst)
     SetForegroundWindow(hwnd);
 
     MSG msg;
-    while (GetMessage(&msg, NULL, 0, 0))
+    BOOL bDone = FALSE;
+    while (!bDone && GetMessage(&msg, NULL, 0, 0))
     {
         TranslateMessage(&msg);
         DispatchMessage(&msg);
-        if (g_minutes != 0) break;
+        if (g_minutes != 0) bDone = TRUE;
     }
 
     return g_minutes;
@@ -278,8 +301,8 @@ int WINAPI wWinMain(HINSTANCE hinst, HINSTANCE hprev, LPWSTR szcmd, int ncmd)
 
     AddTrayIcon();
 
-    // 阻止睡眠
-    SetThreadExecutionState(ES_CONTINUOUS | ES_SYSTEM_REQUIRED);
+    // 初始阻止睡眠
+    KeepAwake();
 
     // 启动倒计时
     g_seconds = g_minutes * 60;
