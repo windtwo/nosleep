@@ -13,6 +13,9 @@
 #define ID_EXIT 1001
 #define WM_TRAYICON (WM_USER + 1)
 
+// 单实例互斥量
+static HANDLE g_hMutex = NULL;
+
 // 防止显示器关闭的标志 (Windows 10 1607+)
 #define MY_ES_DISPLAY_REQUIRED 0x00000002
 
@@ -264,6 +267,14 @@ int WINAPI wWinMain(HINSTANCE hinst, HINSTANCE hprev, LPWSTR szcmd, int ncmd)
     (void)szcmd;
     (void)ncmd;
 
+    // 检查是否已有实例运行
+    g_hMutex = CreateMutexW(NULL, TRUE, L"NoSleep_SingleInstance_Mutex");
+    if (GetLastError() == ERROR_ALREADY_EXISTS)
+    {
+        MessageBoxW(NULL, L"NoSleep 已经在运行中！\n\n请勿同时运行多个实例。", L"提示", MB_OK | MB_ICONINFORMATION);
+        return 0;
+    }
+
     InitCommonControls();
 
     g_hicon = LoadAppIcon();
@@ -320,6 +331,13 @@ int WINAPI wWinMain(HINSTANCE hinst, HINSTANCE hprev, LPWSTR szcmd, int ncmd)
     {
         TranslateMessage(&msg);
         DispatchMessage(&msg);
+    }
+
+    // 释放互斥量
+    if (g_hMutex)
+    {
+        ReleaseMutex(g_hMutex);
+        CloseHandle(g_hMutex);
     }
 
     return 0;
