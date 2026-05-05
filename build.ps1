@@ -13,7 +13,7 @@ if ($LASTEXITCODE -ne 0) {
 
 # Compile executable
 Write-Host "Compiling executable..."
-gcc -static -o nosleep_pure.exe nosleep_win32.c nosleep.res -mwindows -municode -lcomctl32
+gcc -static -o nosleep_pure.exe nosleep_win32.c nosleep.res -mwindows -municode -lcomctl32 -lshell32
 if ($LASTEXITCODE -ne 0) {
     Write-Host "Compilation failed!" -ForegroundColor Red
     exit 1

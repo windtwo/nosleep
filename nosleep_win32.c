@@ -1,8 +1,9 @@
 // NoSleep - 纯 Win32 API 版本
-// 编译：gcc -static -o nosleep_pure.exe nosleep_win32.c nosleep.res -mwindows -municode -lcomctl32
+// 编译：gcc -static -o nosleep_pure.exe nosleep_win32.c nosleep.res -mwindows -municode -lcomctl32 -lshell32
 
 #include <windows.h>
 #include <commctrl.h>
+#include <shellapi.h>
 #include <stdio.h>
 #include <stdlib.h>
 
@@ -11,6 +12,15 @@
 #define ID_TRAY 1
 #define ID_TIMER 1
 #define ID_EXIT 1001
+#define ID_POSTPONE_30 1002
+#define ID_EDIT_MINUTES 101
+#define ID_START_CUSTOM 102
+#define ID_PRESET_30 1101
+#define ID_PRESET_60 1102
+#define ID_PRESET_90 1103
+#define ID_PRESET_120 1104
+#define ID_PRESET_180 1105
+#define ID_PRESET_240 1106
 #define WM_TRAYICON (WM_USER + 1)
 
 // 单实例互斥量
@@ -24,6 +34,12 @@ static int g_seconds = 0;
 static HWND g_hwnd = NULL;
 static HICON g_hicon = NULL;
 static NOTIFYICONDATAW g_nid = {0};
+
+static void StartInputWithMinutes(HWND hwnd, int minutes)
+{
+    g_minutes = minutes;
+    DestroyWindow(hwnd);
+}
 
 // 阻止睡眠和锁屏
 static void KeepAwake(void)
@@ -61,7 +77,7 @@ static void ShowBalloon(const wchar_t *title, const wchar_t *info)
 static void UpdateTrayTip(void)
 {
     wchar_t tip[128];
-    swprintf(tip, 128, L"NoSleep: %dm %02ds", g_seconds / 60, g_seconds % 60);
+    swprintf(tip, 128, L"NoSleep: 还剩 %d 分 %02d 秒", g_seconds / 60, g_seconds % 60);
 
     NOTIFYICONDATAW nid = {0};
     nid.cbSize = sizeof(NOTIFYICONDATAW);
@@ -70,6 +86,16 @@ static void UpdateTrayTip(void)
     nid.uFlags = NIF_TIP;
     wcsncpy(nid.szTip, tip, 127);
     Shell_NotifyIconW(NIM_MODIFY, &nid);
+}
+
+static void PostponeThirtyMinutes(HWND hwnd)
+{
+    g_seconds += 30 * 60;
+    KillTimer(hwnd, 2);
+    SetTimer(hwnd, ID_TIMER, 1000, NULL);
+    KeepAwake();
+    UpdateTrayTip();
+    ShowBalloon(L"NoSleep", L"已推迟 30 分钟");
 }
 
 // 添加托盘图标
@@ -100,7 +126,9 @@ static LRESULT CALLBACK TrayWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
             if (lParam == WM_RBUTTONUP)
             {
                 HMENU hmenu = CreatePopupMenu();
-                AppendMenuW(hmenu, MF_STRING, ID_EXIT, L"Exit");
+                AppendMenuW(hmenu, MF_STRING, ID_POSTPONE_30, L"推迟半小时");
+                AppendMenuW(hmenu, MF_SEPARATOR, 0, NULL);
+                AppendMenuW(hmenu, MF_STRING, ID_EXIT, L"退出");
                 POINT pt;
                 GetCursorPos(&pt);
                 SetForegroundWindow(hwnd);
@@ -113,14 +141,18 @@ static LRESULT CALLBACK TrayWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
                 if (g_seconds > 0)
                 {
                     wchar_t info[64];
-                    swprintf(info, 64, L"%dm %02ds remaining", g_seconds / 60, g_seconds % 60);
-                    ShowBalloon(L"Time Remaining", info);
+                    swprintf(info, 64, L"还剩 %d 分 %02d 秒", g_seconds / 60, g_seconds % 60);
+                    ShowBalloon(L"剩余时间", info);
                 }
             }
             break;
 
         case WM_COMMAND:
-            if (LOWORD(wParam) == ID_EXIT)
+            if (LOWORD(wParam) == ID_POSTPONE_30)
+            {
+                PostponeThirtyMinutes(hwnd);
+            }
+            else if (LOWORD(wParam) == ID_EXIT)
             {
                 DestroyWindow(hwnd);
             }
@@ -135,7 +167,7 @@ static LRESULT CALLBACK TrayWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
                 if (g_seconds == 0)
                 {
                     KillTimer(hwnd, ID_TIMER);
-                    ShowBalloon(L"Done", L"Time is up!");
+                    ShowBalloon(L"已完成", L"防休眠时间已结束");
                     SetTimer(hwnd, 2, 2000, NULL);
                 }
                 else
@@ -178,17 +210,49 @@ static LRESULT CALLBACK InputWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
     {
         case WM_CREATE:
         {
-            CreateWindowW(L"STATIC", L"Enter minutes to keep awake:",
+            CreateWindowW(L"STATIC", L"请选择保持唤醒时长",
                 WS_CHILD | WS_VISIBLE | SS_CENTER,
-                20, 20, 210, 25, hwnd, NULL, GetModuleHandle(NULL), NULL);
+                20, 18, 280, 24, hwnd, NULL, GetModuleHandle(NULL), NULL);
+
+            CreateWindowW(L"STATIC", L"常用时长",
+                WS_CHILD | WS_VISIBLE,
+                24, 54, 90, 20, hwnd, NULL, GetModuleHandle(NULL), NULL);
+
+            CreateWindowW(L"BUTTON", L"30 分钟",
+                WS_CHILD | WS_VISIBLE,
+                24, 78, 88, 34, hwnd, (HMENU)ID_PRESET_30, GetModuleHandle(NULL), NULL);
+
+            CreateWindowW(L"BUTTON", L"1 小时",
+                WS_CHILD | WS_VISIBLE,
+                118, 78, 88, 34, hwnd, (HMENU)ID_PRESET_60, GetModuleHandle(NULL), NULL);
+
+            CreateWindowW(L"BUTTON", L"90 分钟",
+                WS_CHILD | WS_VISIBLE,
+                212, 78, 88, 34, hwnd, (HMENU)ID_PRESET_90, GetModuleHandle(NULL), NULL);
+
+            CreateWindowW(L"BUTTON", L"2 小时",
+                WS_CHILD | WS_VISIBLE,
+                24, 118, 88, 34, hwnd, (HMENU)ID_PRESET_120, GetModuleHandle(NULL), NULL);
+
+            CreateWindowW(L"BUTTON", L"3 小时",
+                WS_CHILD | WS_VISIBLE,
+                118, 118, 88, 34, hwnd, (HMENU)ID_PRESET_180, GetModuleHandle(NULL), NULL);
+
+            CreateWindowW(L"BUTTON", L"4 小时",
+                WS_CHILD | WS_VISIBLE,
+                212, 118, 88, 34, hwnd, (HMENU)ID_PRESET_240, GetModuleHandle(NULL), NULL);
+
+            CreateWindowW(L"STATIC", L"自定义分钟：",
+                WS_CHILD | WS_VISIBLE,
+                24, 174, 96, 24, hwnd, NULL, GetModuleHandle(NULL), NULL);
 
             hedit = CreateWindowW(L"EDIT", L"30",
                 WS_CHILD | WS_VISIBLE | WS_BORDER | ES_CENTER,
-                45, 55, 160, 35, hwnd, (HMENU)101, GetModuleHandle(NULL), NULL);
+                122, 170, 82, 30, hwnd, (HMENU)ID_EDIT_MINUTES, GetModuleHandle(NULL), NULL);
 
-            CreateWindowW(L"BUTTON", L"OK",
+            CreateWindowW(L"BUTTON", L"开始",
                 WS_CHILD | WS_VISIBLE | BS_DEFPUSHBUTTON,
-                75, 105, 100, 35, hwnd, (HMENU)102, GetModuleHandle(NULL), NULL);
+                214, 169, 86, 32, hwnd, (HMENU)ID_START_CUSTOM, GetModuleHandle(NULL), NULL);
 
             SendMessage(hwnd, WM_SETICON, ICON_BIG, (LPARAM)g_hicon);
             SetFocus(hedit);
@@ -196,18 +260,47 @@ static LRESULT CALLBACK InputWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
         }
 
         case WM_COMMAND:
-            if (LOWORD(wParam) == 102)
+            switch (LOWORD(wParam))
             {
-                wchar_t buf[16] = {0};
-                GetWindowTextW(hedit, buf, 16);
-                g_minutes = _wtoi(buf);
-                if (g_minutes > 0 && g_minutes <= 1440)
+                case ID_PRESET_30:
+                    StartInputWithMinutes(hwnd, 30);
+                    break;
+
+                case ID_PRESET_60:
+                    StartInputWithMinutes(hwnd, 60);
+                    break;
+
+                case ID_PRESET_90:
+                    StartInputWithMinutes(hwnd, 90);
+                    break;
+
+                case ID_PRESET_120:
+                    StartInputWithMinutes(hwnd, 120);
+                    break;
+
+                case ID_PRESET_180:
+                    StartInputWithMinutes(hwnd, 180);
+                    break;
+
+                case ID_PRESET_240:
+                    StartInputWithMinutes(hwnd, 240);
+                    break;
+
+                case ID_START_CUSTOM:
                 {
-                    DestroyWindow(hwnd);
-                }
-                else
-                {
-                    MessageBoxW(hwnd, L"Please enter 1-1440", L"Error", MB_OK | MB_ICONWARNING);
+                    wchar_t buf[16] = {0};
+                    int minutes;
+                    GetWindowTextW(hedit, buf, 16);
+                    minutes = _wtoi(buf);
+                    if (minutes > 0 && minutes <= 1440)
+                    {
+                        StartInputWithMinutes(hwnd, minutes);
+                    }
+                    else
+                    {
+                        MessageBoxW(hwnd, L"请输入 1 到 1440 之间的分钟数。", L"输入有误", MB_OK | MB_ICONWARNING);
+                    }
+                    break;
                 }
             }
             return 0;
@@ -238,9 +331,9 @@ static int ShowInputDialog(HINSTANCE hinst)
 
     HWND hwnd = CreateWindowExW(
         WS_EX_DLGMODALFRAME | WS_EX_TOPMOST,
-        L"NoSleepInput", L"NoSleep",
+        L"NoSleepInput", L"NoSleep 防休眠",
         WS_CAPTION | WS_SYSMENU | WS_VISIBLE,
-        (sw - 250) / 2, (sh - 180) / 2, 250, 180,
+        (sw - 340) / 2, (sh - 270) / 2, 340, 270,
         NULL, NULL, hinst, NULL);
 
     if (!hwnd) return 0;
@@ -255,7 +348,7 @@ static int ShowInputDialog(HINSTANCE hinst)
     {
         TranslateMessage(&msg);
         DispatchMessage(&msg);
-        if (g_minutes != 0) bDone = TRUE;
+        if (g_minutes != 0 || !IsWindow(hwnd)) bDone = TRUE;
     }
 
     return g_minutes;
@@ -322,7 +415,7 @@ int WINAPI wWinMain(HINSTANCE hinst, HINSTANCE hprev, LPWSTR szcmd, int ncmd)
     // 延时显示初始通知，确保托盘图标已准备好
     Sleep(500);
     wchar_t infomsg[256];
-    swprintf(infomsg, 256, L"Keeping awake for %d minutes", g_minutes);
+    swprintf(infomsg, 256, L"将保持唤醒 %d 分钟", g_minutes);
     ShowBalloon(L"NoSleep", infomsg);
 
     // 消息循环
