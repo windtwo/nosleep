@@ -9,6 +9,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <wchar.h>
 #include <wctype.h>
 
 #define IDI_APP_ICON 1
@@ -19,6 +20,7 @@
 #define ID_INITIAL_BALLOON_TIMER 3
 #define ID_EXIT 1001
 #define ID_POSTPONE_30 1002
+#define ID_PAUSE_RESUME 1003
 #define ID_EDIT_MINUTES 101
 #define ID_START_CUSTOM 102
 #define ID_LABEL_TITLE 103
@@ -31,6 +33,7 @@
 #define ID_PRESET_120 1104
 #define ID_PRESET_180 1105
 #define ID_PRESET_240 1106
+#define ID_SETDUR_FIRST 1201
 #define WM_TRAYICON (WM_USER + 1)
 #define MAX_MINUTES 1440
 #define POSTPONE_MILLISECONDS (30ULL * 60ULL * 1000ULL)
@@ -48,6 +51,8 @@ static HANDLE g_hMutex = NULL;
 
 static int g_minutes = 0;
 static ULONGLONG g_deadlineMs = 0;
+static BOOL g_paused = FALSE;
+static ULONGLONG g_pausedRemainingMs = 0;
 static HWND g_hwnd = NULL;
 static HICON g_hicon = NULL;
 static NOTIFYICONDATAW g_nid = {0};
@@ -62,6 +67,9 @@ typedef HRESULT (WINAPI *SetProcessDpiAwarenessFunc)(int);
 typedef BOOL (WINAPI *SetProcessDPIAwareFunc)(void);
 typedef UINT (WINAPI *GetDpiForWindowFunc)(HWND);
 typedef BOOL (WINAPI *AdjustWindowRectExForDpiFunc)(LPRECT, DWORD, BOOL, DWORD, UINT);
+
+static GetDpiForWindowFunc g_pGetDpiForWindow = NULL;
+static AdjustWindowRectExForDpiFunc g_pAdjustWindowRectExForDpi = NULL;
 
 typedef struct PresetButton
 {
@@ -93,6 +101,9 @@ static void LoadFunctionAddress(HMODULE module, const char *name, void *target, 
     }
 }
 
+// 兜底：nosleep.manifest 已声明 PerMonitorV2 DPI 感知，正常情况下由 manifest 生效，
+// 此处的 API 调用会因 manifest 优先而返回 ACCESS_DENIED（已按成功处理）。仅当 manifest
+// 被剥离（反编译/重打包）时，这段代码才会真正设置 DPI 感知。
 static void EnableBestDpiAwareness(void)
 {
     HMODULE user32 = GetModuleHandleW(L"user32.dll");
@@ -147,19 +158,26 @@ static void EnableBestDpiAwareness(void)
     }
 }
 
-static UINT GetWindowDpiCompat(HWND hwnd)
+// 启动时解析一次高 DPI 相关函数指针，避免每次调用都 GetProcAddress。
+static void InitDpiFunctions(void)
 {
     HMODULE user32 = GetModuleHandleW(L"user32.dll");
-    GetDpiForWindowFunc getDpi = NULL;
-    UINT dpi = 0;
-
     if (user32)
     {
-        LoadFunctionAddress(user32, "GetDpiForWindow", &getDpi, sizeof(getDpi));
-        if (getDpi)
-        {
-            dpi = getDpi(hwnd);
-        }
+        LoadFunctionAddress(user32, "GetDpiForWindow",
+            &g_pGetDpiForWindow, sizeof(g_pGetDpiForWindow));
+        LoadFunctionAddress(user32, "AdjustWindowRectExForDpi",
+            &g_pAdjustWindowRectExForDpi, sizeof(g_pAdjustWindowRectExForDpi));
+    }
+}
+
+static UINT GetWindowDpiCompat(HWND hwnd)
+{
+    UINT dpi = 0;
+
+    if (g_pGetDpiForWindow)
+    {
+        dpi = g_pGetDpiForWindow(hwnd);
     }
 
     if (dpi == 0)
@@ -232,35 +250,71 @@ static void ShowBalloon(const wchar_t *title, const wchar_t *info)
     nid.cbSize = sizeof(NOTIFYICONDATAW);
     nid.hWnd = g_hwnd;
     nid.uID = ID_TRAY;
-    nid.uFlags = NIF_INFO;
-    nid.dwInfoFlags = NIIF_INFO;
+    nid.uFlags = NIF_INFO | NIF_ICON;
+    nid.dwInfoFlags = NIIF_USER;
     nid.hIcon = g_hicon;
     wcsncpy(nid.szInfoTitle, title, 63);
+    nid.szInfoTitle[63] = L'\0';
     wcsncpy(nid.szInfo, info, 255);
+    nid.szInfo[255] = L'\0';
     Shell_NotifyIconW(NIM_MODIFY, &nid);
 }
 
 // 更新托盘文本
 static int GetRemainingSeconds(void)
 {
-    ULONGLONG now = GetTickCount64();
     ULONGLONG remainingMs;
     ULONGLONG remainingSeconds;
 
-    if (now >= g_deadlineMs)
+    if (g_paused)
     {
-        return 0;
+        remainingMs = g_pausedRemainingMs;
+    }
+    else
+    {
+        ULONGLONG now = GetTickCount64();
+        if (now >= g_deadlineMs)
+        {
+            return 0;
+        }
+        remainingMs = g_deadlineMs - now;
     }
 
-    remainingMs = g_deadlineMs - now;
     remainingSeconds = (remainingMs + 999ULL) / 1000ULL;
     return remainingSeconds > INT_MAX ? INT_MAX : (int)remainingSeconds;
+}
+
+// 将剩余秒数格式化为 "X 小时 Y 分 ZZ 秒"（不足 1 小时则省略小时）。
+static void FormatRemaining(wchar_t *out, size_t cap, int seconds)
+{
+    int hours = seconds / 3600;
+    int minutes = (seconds % 3600) / 60;
+    int secs = seconds % 60;
+
+    if (hours > 0)
+    {
+        swprintf(out, cap, L"%d 小时 %d 分 %02d 秒", hours, minutes, secs);
+    }
+    else
+    {
+        swprintf(out, cap, L"%d 分 %02d 秒", minutes, secs);
+    }
 }
 
 static void UpdateTrayTip(int seconds)
 {
     wchar_t tip[128];
-    swprintf(tip, 128, L"NoSleep: 还剩 %d 分 %02d 秒", seconds / 60, seconds % 60);
+    wchar_t remaining[96];
+
+    FormatRemaining(remaining, 96, seconds);
+    if (g_paused)
+    {
+        swprintf(tip, 128, L"NoSleep: 已暂停，还剩 %ls", remaining);
+    }
+    else
+    {
+        swprintf(tip, 128, L"NoSleep: 还剩 %ls", remaining);
+    }
 
     NOTIFYICONDATAW nid = {0};
     nid.cbSize = sizeof(NOTIFYICONDATAW);
@@ -268,6 +322,7 @@ static void UpdateTrayTip(int seconds)
     nid.uID = ID_TRAY;
     nid.uFlags = NIF_TIP;
     wcsncpy(nid.szTip, tip, 127);
+    nid.szTip[127] = L'\0';
     Shell_NotifyIconW(NIM_MODIFY, &nid);
 }
 
@@ -304,6 +359,7 @@ static BOOL AddTrayIcon(void)
     g_nid.uCallbackMessage = WM_TRAYICON;
     g_nid.hIcon = g_hicon;
     wcsncpy(g_nid.szTip, L"NoSleep", 63);
+    g_nid.szTip[63] = L'\0';
     g_trayIconAdded = Shell_NotifyIconW(NIM_ADD, &g_nid);
     return g_trayIconAdded;
 }
@@ -344,8 +400,18 @@ static void HandleCountdownTimer(HWND hwnd)
 
 static void PostponeThirtyMinutes(HWND hwnd)
 {
-    ULONGLONG now = GetTickCount64();
+    ULONGLONG now;
 
+    // 暂停状态下推迟：只累加剩余时间，不重新开启防休眠或定时器。
+    if (g_paused)
+    {
+        g_pausedRemainingMs += POSTPONE_MILLISECONDS;
+        UpdateTrayTip(GetRemainingSeconds());
+        ShowBalloon(L"NoSleep", L"已推迟 30 分钟");
+        return;
+    }
+
+    now = GetTickCount64();
     if (g_deadlineMs < now)
     {
         g_deadlineMs = now;
@@ -362,6 +428,81 @@ static void PostponeThirtyMinutes(HWND hwnd)
 
     UpdateTrayTip(GetRemainingSeconds());
     ShowBalloon(L"NoSleep", L"已推迟 30 分钟");
+}
+
+// 暂停计时：记录剩余时间并解除防休眠。
+static void PauseKeepAwake(HWND hwnd)
+{
+    ULONGLONG now;
+
+    if (g_paused)
+    {
+        return;
+    }
+
+    now = GetTickCount64();
+    g_pausedRemainingMs = g_deadlineMs > now ? g_deadlineMs - now : 0;
+    g_paused = TRUE;
+
+    KillTimer(hwnd, ID_COUNTDOWN_TIMER);
+    KillTimer(hwnd, ID_EXIT_TIMER);
+    DisableKeepAwake();
+
+    UpdateTrayTip(GetRemainingSeconds());
+    ShowBalloon(L"NoSleep", L"已暂停");
+}
+
+// 继续计时：按暂停时记录的剩余时间重新设定截止时刻。
+static void ResumeKeepAwake(HWND hwnd)
+{
+    if (!g_paused)
+    {
+        return;
+    }
+
+    g_paused = FALSE;
+
+    // 暂停时剩余已归零：直接走完成流程。
+    if (g_pausedRemainingMs == 0)
+    {
+        g_deadlineMs = GetTickCount64();
+        HandleCountdownTimer(hwnd);
+        return;
+    }
+
+    g_deadlineMs = GetTickCount64() + g_pausedRemainingMs;
+    if (!EnableKeepAwake() || !ScheduleCountdownTimer(hwnd))
+    {
+        MessageBoxW(hwnd, L"无法继续保持系统唤醒。", L"NoSleep 错误", MB_OK | MB_ICONERROR);
+        DestroyWindow(hwnd);
+        return;
+    }
+
+    UpdateTrayTip(GetRemainingSeconds());
+    ShowBalloon(L"NoSleep", L"已继续计时");
+}
+
+// 从托盘菜单重新设定一个新的时长。
+static void ApplyNewDuration(HWND hwnd, int minutes)
+{
+    g_paused = FALSE;
+    g_pausedRemainingMs = 0;
+
+    KillTimer(hwnd, ID_EXIT_TIMER);
+    g_deadlineMs = GetTickCount64() + (ULONGLONG)minutes * 60ULL * 1000ULL;
+    if (!EnableKeepAwake() || !ScheduleCountdownTimer(hwnd))
+    {
+        MessageBoxW(hwnd, L"无法重新开始计时。", L"NoSleep 错误", MB_OK | MB_ICONERROR);
+        DestroyWindow(hwnd);
+        return;
+    }
+
+    UpdateTrayTip(GetRemainingSeconds());
+    {
+        wchar_t info[64];
+        swprintf(info, 64, L"已设置为 %d 分钟", minutes);
+        ShowBalloon(L"NoSleep", info);
+    }
 }
 
 // 托盘窗口过程
@@ -383,10 +524,23 @@ static LRESULT CALLBACK TrayWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
             if (lParam == WM_RBUTTONUP)
             {
                 HMENU hmenu = CreatePopupMenu();
+                HMENU hDurationMenu = CreatePopupMenu();
+                POINT pt;
+                size_t i;
+
+                for (i = 0; i < sizeof(g_presetButtons) / sizeof(g_presetButtons[0]); i++)
+                {
+                    AppendMenuW(hDurationMenu, MF_STRING,
+                        ID_SETDUR_FIRST + i, g_presetButtons[i].text);
+                }
+
+                AppendMenuW(hmenu, MF_STRING, ID_PAUSE_RESUME,
+                    g_paused ? L"继续计时" : L"暂停计时");
+                AppendMenuW(hmenu, MF_POPUP, (UINT_PTR)hDurationMenu, L"设置时长");
                 AppendMenuW(hmenu, MF_STRING, ID_POSTPONE_30, L"推迟半小时");
                 AppendMenuW(hmenu, MF_SEPARATOR, 0, NULL);
                 AppendMenuW(hmenu, MF_STRING, ID_EXIT, L"退出");
-                POINT pt;
+
                 GetCursorPos(&pt);
                 SetForegroundWindow(hwnd);
                 TrackPopupMenu(hmenu, 0, pt.x, pt.y, 0, hwnd, NULL);
@@ -395,27 +549,55 @@ static LRESULT CALLBACK TrayWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
             }
             else if (lParam == WM_LBUTTONDBLCLK)
             {
-                // 双击显示剩余时间
+                // 双击显示剩余时间（含暂停状态）
                 int seconds = GetRemainingSeconds();
-                if (seconds > 0)
+                wchar_t remaining[96];
+                wchar_t info[128];
+
+                FormatRemaining(remaining, 96, seconds);
+                if (g_paused)
                 {
-                    wchar_t info[64];
-                    swprintf(info, 64, L"还剩 %d 分 %02d 秒", seconds / 60, seconds % 60);
+                    swprintf(info, 128, L"已暂停，还剩 %ls", remaining);
+                    ShowBalloon(L"剩余时间", info);
+                }
+                else if (seconds > 0)
+                {
+                    swprintf(info, 128, L"还剩 %ls", remaining);
                     ShowBalloon(L"剩余时间", info);
                 }
             }
             break;
 
         case WM_COMMAND:
-            if (LOWORD(wParam) == ID_POSTPONE_30)
+        {
+            int cmd = LOWORD(wParam);
+            size_t presetCount = sizeof(g_presetButtons) / sizeof(g_presetButtons[0]);
+
+            if (cmd == ID_POSTPONE_30)
             {
                 PostponeThirtyMinutes(hwnd);
             }
-            else if (LOWORD(wParam) == ID_EXIT)
+            else if (cmd == ID_PAUSE_RESUME)
+            {
+                if (g_paused)
+                {
+                    ResumeKeepAwake(hwnd);
+                }
+                else
+                {
+                    PauseKeepAwake(hwnd);
+                }
+            }
+            else if (cmd == ID_EXIT)
             {
                 DestroyWindow(hwnd);
             }
+            else if (cmd >= ID_SETDUR_FIRST && cmd < ID_SETDUR_FIRST + (int)presetCount)
+            {
+                ApplyNewDuration(hwnd, g_presetButtons[cmd - ID_SETDUR_FIRST].minutes);
+            }
             break;
+        }
 
         case WM_TIMER:
             if (wParam == ID_COUNTDOWN_TIMER)
@@ -441,7 +623,7 @@ static LRESULT CALLBACK TrayWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
             break;
 
         case WM_POWERBROADCAST:
-            if (wParam == PBT_APMRESUMEAUTOMATIC && GetRemainingSeconds() > 0)
+            if (wParam == PBT_APMRESUMEAUTOMATIC && !g_paused && GetRemainingSeconds() > 0)
             {
                 if (!EnableKeepAwake())
                 {
@@ -502,6 +684,7 @@ static HFONT CreateInputFont(UINT dpi, int pointSize, int weight)
     else
     {
         wcsncpy(font.lfFaceName, L"Microsoft YaHei UI", LF_FACESIZE - 1);
+        font.lfFaceName[LF_FACESIZE - 1] = L'\0';
         font.lfCharSet = DEFAULT_CHARSET;
     }
 
@@ -602,8 +785,6 @@ static void SizeAndCenterInputWindow(HWND hwnd, UINT dpi)
     };
     DWORD style = (DWORD)GetWindowLongPtrW(hwnd, GWL_STYLE);
     DWORD exStyle = (DWORD)GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
-    HMODULE user32 = GetModuleHandleW(L"user32.dll");
-    AdjustWindowRectExForDpiFunc adjustForDpi = NULL;
     HMONITOR monitor;
     MONITORINFO monitorInfo = {0};
     int width;
@@ -611,14 +792,9 @@ static void SizeAndCenterInputWindow(HWND hwnd, UINT dpi)
     int x;
     int y;
 
-    if (user32)
+    if (g_pAdjustWindowRectExForDpi)
     {
-        LoadFunctionAddress(user32, "AdjustWindowRectExForDpi",
-            &adjustForDpi, sizeof(adjustForDpi));
-    }
-    if (adjustForDpi)
-    {
-        adjustForDpi(&rect, style, FALSE, exStyle, dpi);
+        g_pAdjustWindowRectExForDpi(&rect, style, FALSE, exStyle, dpi);
     }
     else
     {
@@ -798,8 +974,14 @@ static LRESULT CALLBACK InputWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
         }
 
         case WM_SETTINGCHANGE:
-            RecreateInputFonts(hwnd, GetWindowDpiCompat(hwnd));
-            InvalidateRect(hwnd, NULL, TRUE);
+            // 仅在界面字体/非客户区度量相关的设置变化时才重建字体，
+            // 避免每次系统设置广播都无谓地重建 GDI 字体对象。
+            if (wParam == SPI_SETNONCLIENTMETRICS ||
+                (lParam && wcscmp((const wchar_t *)lParam, L"WindowMetrics") == 0))
+            {
+                RecreateInputFonts(hwnd, GetWindowDpiCompat(hwnd));
+                InvalidateRect(hwnd, NULL, TRUE);
+            }
             return 0;
 
         case WM_THEMECHANGED:
@@ -927,9 +1109,10 @@ int WINAPI wWinMain(HINSTANCE hinst, HINSTANCE hprev, LPWSTR szcmd, int ncmd)
     (void)ncmd;
 
     EnableBestDpiAwareness();
+    InitDpiFunctions();
 
     // 检查是否已有实例运行
-    g_hMutex = CreateMutexW(NULL, TRUE, L"NoSleep_SingleInstance_Mutex");
+    g_hMutex = CreateMutexW(NULL, TRUE, L"Local\\NoSleep_SingleInstance_Mutex");
     if (!g_hMutex)
     {
         MessageBoxW(NULL, L"无法创建单实例锁。", L"NoSleep 错误", MB_OK | MB_ICONERROR);
@@ -961,7 +1144,9 @@ int WINAPI wWinMain(HINSTANCE hinst, HINSTANCE hprev, LPWSTR szcmd, int ncmd)
     {
         if (!ParseMinutes(argv[1], &g_minutes))
         {
-            MessageBoxW(NULL, L"请输入 1 到 1440 之间的分钟数。", L"输入有误", MB_OK | MB_ICONWARNING);
+            // 命令行时长无效时，回退到输入窗口而不是直接退出。
+            MessageBoxW(NULL, L"命令行时长无效，请重新选择时长。", L"输入有误", MB_OK | MB_ICONWARNING);
+            g_minutes = ShowInputDialog(hinst);
         }
         LocalFree(argv);
     }

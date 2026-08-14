@@ -1,0 +1,47 @@
+name: Build NoSleep
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up MinGW-w64 (MSYS2)
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: false
+          install: >-
+            mingw-w64-x86_64-gcc
+            mingw-w64-x86_64-binutils
+
+      - name: Show toolchain versions
+        run: |
+          gcc --version
+          windres --version
+
+      - name: Compile resources
+        run: windres -i nosleep.rc -o nosleep.res -O coff
+
+      - name: Compile executable
+        run: gcc -s -static -o nosleep_pure.exe nosleep_win32.c nosleep.res -mwindows -municode -lcomctl32 -lshell32
+
+      - name: Verify output
+        run: |
+          ls -l nosleep_pure.exe
+          file nosleep_pure.exe
+
+      - name: Upload executable artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: nosleep-pure-exe
+          path: nosleep_pure.exe
+          if-no-files-found: error
