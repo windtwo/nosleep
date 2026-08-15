@@ -19,8 +19,6 @@
 #define ID_EXIT_TIMER 2
 #define ID_INITIAL_BALLOON_TIMER 3
 #define ID_EXIT 1001
-#define ID_POSTPONE_30 1002
-#define ID_PAUSE_RESUME 1003
 #define ID_EDIT_MINUTES 101
 #define ID_START_CUSTOM 102
 #define ID_LABEL_TITLE 103
@@ -36,7 +34,6 @@
 #define ID_SETDUR_FIRST 1201
 #define WM_TRAYICON (WM_USER + 1)
 #define MAX_MINUTES 1440
-#define POSTPONE_MILLISECONDS (30ULL * 60ULL * 1000ULL)
 #define COUNTDOWN_REFRESH_MILLISECONDS 10000U
 #define DEFAULT_DPI 96U
 #define INPUT_CLIENT_WIDTH 360
@@ -51,8 +48,6 @@ static HANDLE g_hMutex = NULL;
 
 static int g_minutes = 0;
 static ULONGLONG g_deadlineMs = 0;
-static BOOL g_paused = FALSE;
-static ULONGLONG g_pausedRemainingMs = 0;
 static HWND g_hwnd = NULL;
 static HICON g_hicon = NULL;
 static NOTIFYICONDATAW g_nid = {0};
@@ -263,23 +258,16 @@ static void ShowBalloon(const wchar_t *title, const wchar_t *info)
 // 更新托盘文本
 static int GetRemainingSeconds(void)
 {
+    ULONGLONG now = GetTickCount64();
     ULONGLONG remainingMs;
     ULONGLONG remainingSeconds;
 
-    if (g_paused)
+    if (now >= g_deadlineMs)
     {
-        remainingMs = g_pausedRemainingMs;
-    }
-    else
-    {
-        ULONGLONG now = GetTickCount64();
-        if (now >= g_deadlineMs)
-        {
-            return 0;
-        }
-        remainingMs = g_deadlineMs - now;
+        return 0;
     }
 
+    remainingMs = g_deadlineMs - now;
     remainingSeconds = (remainingMs + 999ULL) / 1000ULL;
     return remainingSeconds > INT_MAX ? INT_MAX : (int)remainingSeconds;
 }
@@ -307,14 +295,7 @@ static void UpdateTrayTip(int seconds)
     wchar_t remaining[96];
 
     FormatRemaining(remaining, 96, seconds);
-    if (g_paused)
-    {
-        swprintf(tip, 128, L"NoSleep: 已暂停，还剩 %ls", remaining);
-    }
-    else
-    {
-        swprintf(tip, 128, L"NoSleep: 还剩 %ls", remaining);
-    }
+    swprintf(tip, 128, L"NoSleep: 还剩 %ls", remaining);
 
     NOTIFYICONDATAW nid = {0};
     nid.cbSize = sizeof(NOTIFYICONDATAW);
@@ -398,96 +379,9 @@ static void HandleCountdownTimer(HWND hwnd)
     }
 }
 
-static void PostponeThirtyMinutes(HWND hwnd)
-{
-    ULONGLONG now;
-
-    // 暂停状态下推迟：只累加剩余时间，不重新开启防休眠或定时器。
-    if (g_paused)
-    {
-        g_pausedRemainingMs += POSTPONE_MILLISECONDS;
-        UpdateTrayTip(GetRemainingSeconds());
-        ShowBalloon(L"NoSleep", L"已推迟 30 分钟");
-        return;
-    }
-
-    now = GetTickCount64();
-    if (g_deadlineMs < now)
-    {
-        g_deadlineMs = now;
-    }
-    g_deadlineMs += POSTPONE_MILLISECONDS;
-
-    KillTimer(hwnd, ID_EXIT_TIMER);
-    if (!EnableKeepAwake() || !ScheduleCountdownTimer(hwnd))
-    {
-        MessageBoxW(hwnd, L"无法继续保持系统唤醒。", L"NoSleep 错误", MB_OK | MB_ICONERROR);
-        DestroyWindow(hwnd);
-        return;
-    }
-
-    UpdateTrayTip(GetRemainingSeconds());
-    ShowBalloon(L"NoSleep", L"已推迟 30 分钟");
-}
-
-// 暂停计时：记录剩余时间并解除防休眠。
-static void PauseKeepAwake(HWND hwnd)
-{
-    ULONGLONG now;
-
-    if (g_paused)
-    {
-        return;
-    }
-
-    now = GetTickCount64();
-    g_pausedRemainingMs = g_deadlineMs > now ? g_deadlineMs - now : 0;
-    g_paused = TRUE;
-
-    KillTimer(hwnd, ID_COUNTDOWN_TIMER);
-    KillTimer(hwnd, ID_EXIT_TIMER);
-    DisableKeepAwake();
-
-    UpdateTrayTip(GetRemainingSeconds());
-    ShowBalloon(L"NoSleep", L"已暂停");
-}
-
-// 继续计时：按暂停时记录的剩余时间重新设定截止时刻。
-static void ResumeKeepAwake(HWND hwnd)
-{
-    if (!g_paused)
-    {
-        return;
-    }
-
-    g_paused = FALSE;
-
-    // 暂停时剩余已归零：直接走完成流程。
-    if (g_pausedRemainingMs == 0)
-    {
-        g_deadlineMs = GetTickCount64();
-        HandleCountdownTimer(hwnd);
-        return;
-    }
-
-    g_deadlineMs = GetTickCount64() + g_pausedRemainingMs;
-    if (!EnableKeepAwake() || !ScheduleCountdownTimer(hwnd))
-    {
-        MessageBoxW(hwnd, L"无法继续保持系统唤醒。", L"NoSleep 错误", MB_OK | MB_ICONERROR);
-        DestroyWindow(hwnd);
-        return;
-    }
-
-    UpdateTrayTip(GetRemainingSeconds());
-    ShowBalloon(L"NoSleep", L"已继续计时");
-}
-
 // 从托盘菜单重新设定一个新的时长。
 static void ApplyNewDuration(HWND hwnd, int minutes)
 {
-    g_paused = FALSE;
-    g_pausedRemainingMs = 0;
-
     KillTimer(hwnd, ID_EXIT_TIMER);
     g_deadlineMs = GetTickCount64() + (ULONGLONG)minutes * 60ULL * 1000ULL;
     if (!EnableKeepAwake() || !ScheduleCountdownTimer(hwnd))
@@ -534,10 +428,7 @@ static LRESULT CALLBACK TrayWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
                         ID_SETDUR_FIRST + i, g_presetButtons[i].text);
                 }
 
-                AppendMenuW(hmenu, MF_STRING, ID_PAUSE_RESUME,
-                    g_paused ? L"继续计时" : L"暂停计时");
-                AppendMenuW(hmenu, MF_POPUP, (UINT_PTR)hDurationMenu, L"设置时长");
-                AppendMenuW(hmenu, MF_STRING, ID_POSTPONE_30, L"推迟半小时");
+                AppendMenuW(hmenu, MF_POPUP, (UINT_PTR)hDurationMenu, L"重新设置时长");
                 AppendMenuW(hmenu, MF_SEPARATOR, 0, NULL);
                 AppendMenuW(hmenu, MF_STRING, ID_EXIT, L"退出");
 
@@ -549,19 +440,14 @@ static LRESULT CALLBACK TrayWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
             }
             else if (lParam == WM_LBUTTONDBLCLK)
             {
-                // 双击显示剩余时间（含暂停状态）
+                // 双击显示剩余时间
                 int seconds = GetRemainingSeconds();
-                wchar_t remaining[96];
-                wchar_t info[128];
+                if (seconds > 0)
+                {
+                    wchar_t remaining[96];
+                    wchar_t info[128];
 
-                FormatRemaining(remaining, 96, seconds);
-                if (g_paused)
-                {
-                    swprintf(info, 128, L"已暂停，还剩 %ls", remaining);
-                    ShowBalloon(L"剩余时间", info);
-                }
-                else if (seconds > 0)
-                {
+                    FormatRemaining(remaining, 96, seconds);
                     swprintf(info, 128, L"还剩 %ls", remaining);
                     ShowBalloon(L"剩余时间", info);
                 }
@@ -573,22 +459,7 @@ static LRESULT CALLBACK TrayWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
             int cmd = LOWORD(wParam);
             size_t presetCount = sizeof(g_presetButtons) / sizeof(g_presetButtons[0]);
 
-            if (cmd == ID_POSTPONE_30)
-            {
-                PostponeThirtyMinutes(hwnd);
-            }
-            else if (cmd == ID_PAUSE_RESUME)
-            {
-                if (g_paused)
-                {
-                    ResumeKeepAwake(hwnd);
-                }
-                else
-                {
-                    PauseKeepAwake(hwnd);
-                }
-            }
-            else if (cmd == ID_EXIT)
+            if (cmd == ID_EXIT)
             {
                 DestroyWindow(hwnd);
             }
@@ -623,13 +494,12 @@ static LRESULT CALLBACK TrayWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
             break;
 
         case WM_POWERBROADCAST:
-            if (wParam == PBT_APMRESUMEAUTOMATIC && !g_paused && GetRemainingSeconds() > 0)
+            // 系统即将进入睡眠或休眠（手动睡眠、合盖等都会触发）：
+            // 解除防休眠并退出，把系统交还给正常的睡眠流程。
+            if (wParam == PBT_APMSUSPEND)
             {
-                if (!EnableKeepAwake())
-                {
-                    MessageBoxW(hwnd, L"系统恢复后无法继续保持唤醒。", L"NoSleep 错误", MB_OK | MB_ICONERROR);
-                    DestroyWindow(hwnd);
-                }
+                DisableKeepAwake();
+                DestroyWindow(hwnd);
             }
             return TRUE;
 
