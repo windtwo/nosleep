@@ -1,31 +1,29 @@
 # Build script for NoSleep
-# Requires: MinGW-w64 (gcc, windres)
+# Requires: MinGW-w64 (gcc, windres) and make / mingw32-make.
+# All compiler flags live in the Makefile; this script only invokes make.
 
-Write-Host "Building NoSleep..." -ForegroundColor Cyan
+$ErrorActionPreference = 'Stop'
+Push-Location $PSScriptRoot
+try {
+    Write-Host "Building NoSleep..." -ForegroundColor Cyan
 
-# Compile resource file
-Write-Host "Compiling resources..."
-windres -i nosleep.rc -o nosleep.res -O coff
-if ($LASTEXITCODE -ne 0) {
-    Write-Host "Resource compilation failed!" -ForegroundColor Red
-    exit 1
-}
+    $make = Get-Command make, mingw32-make -ErrorAction SilentlyContinue | Select-Object -First 1
+    if (-not $make) {
+        Write-Host "make / mingw32-make not found. Install it (MSYS2: pacman -S make) and retry." -ForegroundColor Red
+        exit 1
+    }
 
-# Compile executable
-Write-Host "Compiling executable..."
-gcc -s -static -o nosleep_pure.exe nosleep_win32.c nosleep.res -mwindows -municode -lcomctl32 -lshell32
-if ($LASTEXITCODE -ne 0) {
-    Write-Host "Compilation failed!" -ForegroundColor Red
-    exit 1
-}
+    & $make.Source
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host "Build failed!" -ForegroundColor Red
+        exit 1
+    }
 
-# Show result
-$exe = Get-Item nosleep_pure.exe -ErrorAction SilentlyContinue
-if ($exe) {
+    $exe = Get-Item nosleep_pure.exe
     Write-Host "Build successful!" -ForegroundColor Green
     Write-Host "Output: $($exe.FullName)"
     Write-Host "Size: $([math]::Round($exe.Length / 1KB, 2)) KB"
-} else {
-    Write-Host "Build failed - executable not found" -ForegroundColor Red
-    exit 1
+}
+finally {
+    Pop-Location
 }
