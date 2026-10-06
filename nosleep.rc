@@ -1,2 +1,38 @@
+#pragma code_page(65001)
+
+#include <winver.h>
+
+// 版本号唯一来源；发布新版本时同步修改 nosleep.manifest 中的 assemblyIdentity version。
+#define NOSLEEP_VERSION         1,5,0,0
+#define NOSLEEP_VERSION_STRING  "1.5.0"
+
 1 ICON "nosleep.ico"
 1 24 "nosleep.manifest"
+
+VS_VERSION_INFO VERSIONINFO
+FILEVERSION     NOSLEEP_VERSION
+PRODUCTVERSION  NOSLEEP_VERSION
+FILEFLAGSMASK   VS_FFI_FILEFLAGSMASK
+FILEFLAGS       0
+FILEOS          VOS_NT_WINDOWS32
+FILETYPE        VFT_APP
+FILESUBTYPE     VFT2_UNKNOWN
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "080404B0"
+        BEGIN
+            VALUE "FileDescription",  "NoSleep 防休眠工具"
+            VALUE "FileVersion",      NOSLEEP_VERSION_STRING
+            VALUE "InternalName",     "nosleep"
+            VALUE "LegalCopyright",   "MIT License"
+            VALUE "OriginalFilename", "nosleep_pure.exe"
+            VALUE "ProductName",      "NoSleep"
+            VALUE "ProductVersion",   NOSLEEP_VERSION_STRING
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x0804, 1200
+    END
+END
